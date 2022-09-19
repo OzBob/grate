@@ -1,47 +1,65 @@
 ﻿using System.IO;
-using System.Threading.Tasks;
+using System.Threading;
 using grate.unittests.TestInfrastructure;
 using Microsoft.Data.Sqlite;
 using NUnit.Framework;
 using Microsoft.Extensions.Logging;
 
-namespace grate.unittests.Sqlite
+namespace grate.unittests.Sqlite;
+
+[SetUpFixture]
+[Category("Sqlite")]
+public class SetupTestEnvironment
 {
-    [SetUpFixture]
-    [Category("Sqlite")]
-    public class SetupTestEnvironment
+        
+    static readonly ILogger<SetupTestEnvironment> Logger = TestConfig.LogFactory.CreateLogger<SetupTestEnvironment>();
+        
+    [OneTimeSetUp]
+    public void RunBeforeAnyTests()
     {
-        
-        static ILogger<SetupTestEnvironment> _logger = TestConfig.LogFactory.CreateLogger<SetupTestEnvironment>();
-        
-        [OneTimeSetUp]
-        public void RunBeforeAnyTests()
-        {
-            var currentDirectory = Directory.GetCurrentDirectory();
-            var dbFiles = Directory.GetFiles(currentDirectory, "*.db");
+        var currentDirectory = Directory.GetCurrentDirectory();
+        var dbFiles = Directory.GetFiles(currentDirectory, "*.db");
             
-            _logger.LogDebug($"Before tests. Deleting old DB files.");
-            foreach (var dbFile in dbFiles)
+        Logger.LogDebug($"Before tests. Deleting old DB files.");
+        foreach (var dbFile in dbFiles)
+        {
+            TryDeletingFile(dbFile);
+        }
+    }
+
+    private static void TryDeletingFile(string dbFile)
+    {
+        var i = 0;
+        var sleepTime = 300;
+        const int maxTries = 5;
+        while (i++ < maxTries)
+        {
+            try
             {
-                _logger.LogDebug("File: {DbFile}", dbFile);
+                Logger.LogDebug("File: {DbFile}", dbFile);
                 File.Delete(dbFile);
+                return;
+            }
+            catch (IOException) when (i <= maxTries)
+            {
+                Thread.Sleep(sleepTime);
             }
         }
+    }
 
-        [OneTimeTearDown]
-        public void RunAfterAnyTests()
+    [OneTimeTearDown]
+    public void RunAfterAnyTests()
+    {
+        SqliteConnection.ClearAllPools();
+            
+        var currentDirectory = Directory.GetCurrentDirectory();
+        var dbFiles = Directory.GetFiles(currentDirectory, "*.db");
+            
+        Logger.LogDebug("After tests. Deleting DB files.");
+        foreach (var dbFile in dbFiles)
         {
-            SqliteConnection.ClearAllPools();
-            
-            var currentDirectory = Directory.GetCurrentDirectory();
-            var dbFiles = Directory.GetFiles(currentDirectory, "*.db");
-            
-            _logger.LogDebug("After tests. Deleting DB files.");
-            foreach (var dbFile in dbFiles)
-            {
-                _logger.LogDebug("File: {DbFile}", dbFile);
-                File.Delete(dbFile);
-            }
+            Logger.LogDebug("File: {DbFile}", dbFile);
+            File.Delete(dbFile);
         }
     }
 }

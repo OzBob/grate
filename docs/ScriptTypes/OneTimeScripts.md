@@ -1,6 +1,7 @@
 ---
 title: "One-Time Scripts"
 permalink: script-types/one-time/
+parent: Script types
 ---
 ## One Time Scripts
 
@@ -9,8 +10,8 @@ These are scripts that are run **exactly once** per database, and never again.  
 ## Folders
 Scripts in the following folders are `one time` scripts by default.
 
-* RunAfterCreateDatabase
-* Up
+* runAfterCreateDatabase
+* up
 
 ## What goes in the Up Folder?
 

@@ -6,117 +6,125 @@ using grate.Configuration;
 using grate.Migration;
 using grate.unittests.TestInfrastructure;
 using NUnit.Framework;
+using static grate.Configuration.KnownFolderKeys;
 
-namespace grate.unittests.Generic.Running_MigrationScripts
+namespace grate.unittests.Generic.Running_MigrationScripts;
+
+[TestFixture]
+// ReSharper disable once InconsistentNaming
+public abstract class Environment_scripts : MigrationsScriptsBase
 {
-    [TestFixture]
-    public abstract class Environment_scripts : MigrationsScriptsBase
+    [Test]
+    public async Task Are_not_run_if_not_in_environment()
     {
-        [Test]
-        public async Task Are_not_run_if_not_in_environment()
+        var db = TestConfig.RandomDatabase();
+
+        GrateMigrator? migrator;
+        
+        var parent = CreateRandomTempDirectory();
+        var knownFolders = FoldersConfiguration.Default(null);
+
+        CreateDummySql(parent, knownFolders[Up], "1_.OTHER.filename.ENV.sql");
+
+        await using (migrator = Context.GetMigrator(db, parent, knownFolders, "TEST"))
         {
-            var db = TestConfig.RandomDatabase();
-
-            GrateMigrator? migrator;
-
-            var knownFolders = KnownFolders.In(CreateRandomTempDirectory());
-            CreateDummySql(knownFolders.Up, "1_.OTHER.filename.ENV.sql");
-
-            await using (migrator = Context.GetMigrator(db, true, knownFolders, "TEST"))
-            {
-                await migrator.Migrate();
-            }
-
-            string[] scripts;
-            string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
-
-            await using (var conn = Context.CreateDbConnection(db))
-            {
-                scripts = (await conn.QueryAsync<string>(sql)).ToArray();
-            }
-
-            scripts.Should().BeEmpty();
+            await migrator.Migrate();
         }
 
-        [Test]
-        public async Task Are_not_run_by_default() //Bug #101
+        string[] scripts;
+        string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
+
+        await using (var conn = Context.CreateDbConnection(db))
         {
-            var db = TestConfig.RandomDatabase();
-
-            GrateMigrator? migrator;
-
-            var knownFolders = KnownFolders.In(CreateRandomTempDirectory());
-            CreateDummySql(knownFolders.Up, "1_.OTHER.filename.ENV.sql");
-
-            await using (migrator = Context.GetMigrator(db, true, knownFolders))
-            {
-                await migrator.Migrate();
-            }
-
-            string[] scripts;
-            string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
-
-            await using (var conn = Context.CreateDbConnection(db))
-            {
-                scripts = (await conn.QueryAsync<string>(sql)).ToArray();
-            }
-
-            scripts.Should().BeEmpty();
+            scripts = (await conn.QueryAsync<string>(sql)).ToArray();
         }
 
-        [Test]
-        public async Task Are_run_if_in_environment()
+        scripts.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task Are_not_run_by_default() //Bug #101
+    {
+        var db = TestConfig.RandomDatabase();
+
+        GrateMigrator? migrator;
+        
+        var parent = CreateRandomTempDirectory();
+        var knownFolders = FoldersConfiguration.Default(null);
+
+        CreateDummySql(parent, knownFolders[Up], "1_.OTHER.filename.ENV.sql");
+
+        await using (migrator = Context.GetMigrator(db, parent, knownFolders))
         {
-            var db = TestConfig.RandomDatabase();
-
-            GrateMigrator? migrator;
-
-            var knownFolders = KnownFolders.In(CreateRandomTempDirectory());
-            CreateDummySql(knownFolders.Up, "1_.TEST.filename.ENV.sql");
-            CreateDummySql(knownFolders.Up, "2_.TEST.ENV.otherfilename.sql");
-
-            await using (migrator = Context.GetMigrator(db, true, knownFolders, "TEST"))
-            {
-                await migrator.Migrate();
-            }
-
-            string[] scripts;
-            string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
-
-            await using (var conn = Context.CreateDbConnection(db))
-            {
-                scripts = (await conn.QueryAsync<string>(sql)).ToArray();
-            }
-
-            scripts.Should().HaveCount(2);
+            await migrator.Migrate();
         }
 
-        [Test]
-        public async Task Non_environment_scripts_are_always_run()
+        string[] scripts;
+        string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
+
+        await using (var conn = Context.CreateDbConnection(db))
         {
-            var db = TestConfig.RandomDatabase();
-
-            GrateMigrator? migrator;
-
-            var knownFolders = KnownFolders.In(CreateRandomTempDirectory());
-            CreateDummySql(knownFolders.Up, "1_.filename.sql");
-            CreateDummySql(knownFolders.Up, "2_.TEST.ENV.otherfilename.sql");
-            CreateDummySql(knownFolders.Up, "2_.TEST.ENV.somethingelse.sql");
-
-            await using (migrator = Context.GetMigrator(db, true, knownFolders, "PROD"))
-            {
-                await migrator.Migrate();
-            }
-
-            string[] scripts;
-            string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
-
-            await using (var conn = Context.CreateDbConnection(db))
-            {
-                scripts = (await conn.QueryAsync<string>(sql)).ToArray();
-            }
-
-            scripts.Should().HaveCount(1);
+            scripts = (await conn.QueryAsync<string>(sql)).ToArray();
         }
+
+        scripts.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task Are_run_if_in_environment()
+    {
+        var db = TestConfig.RandomDatabase();
+
+        GrateMigrator? migrator;
+        var parent = CreateRandomTempDirectory();
+        var knownFolders = FoldersConfiguration.Default(null);
+
+        CreateDummySql(parent, knownFolders[Up], "1_.TEST.filename.ENV.sql");
+        CreateDummySql(parent, knownFolders[Up], "2_.TEST.ENV.otherfilename.sql");
+
+        await using (migrator = Context.GetMigrator(db, parent, knownFolders, "TEST"))
+        {
+            await migrator.Migrate();
+        }
+
+        string[] scripts;
+        string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
+
+        await using (var conn = Context.CreateDbConnection(db))
+        {
+            scripts = (await conn.QueryAsync<string>(sql)).ToArray();
+        }
+
+        scripts.Should().HaveCount(2);
+    }
+
+    [Test]
+    public async Task Non_environment_scripts_are_always_run()
+    {
+        var db = TestConfig.RandomDatabase();
+
+        GrateMigrator? migrator;
+
+        var parent = CreateRandomTempDirectory();
+        var knownFolders = FoldersConfiguration.Default(null);
+        
+        CreateDummySql(parent,knownFolders[Up], "1_.filename.sql");
+        CreateDummySql(parent,knownFolders[Up], "2_.TEST.ENV.otherfilename.sql");
+        CreateDummySql(parent,knownFolders[Up], "2_.TEST.ENV.somethingelse.sql");
+
+        await using (migrator = Context.GetMigrator(db, parent, knownFolders, "PROD"))
+        {
+            await migrator.Migrate();
+        }
+
+        string[] scripts;
+        string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
+
+        await using (var conn = Context.CreateDbConnection(db))
+        {
+            scripts = (await conn.QueryAsync<string>(sql)).ToArray();
+        }
+
+        scripts.Should().HaveCount(1);
     }
 }

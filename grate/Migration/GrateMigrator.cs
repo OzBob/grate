@@ -7,349 +7,415 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Transactions;
 using grate.Configuration;
+using grate.Exceptions;
 using Microsoft.Extensions.Logging;
 
-namespace grate.Migration
+namespace grate.Migration;
+
+public class GrateMigrator : IAsyncDisposable
 {
+    private readonly ILogger<GrateMigrator> _logger;
+    private readonly IDbMigrator _migrator;
 
-    public class GrateMigrator : IAsyncDisposable
+    public IDbMigrator DbMigrator => _migrator;
+
+    public GrateMigrator(ILogger<GrateMigrator> logger, IDbMigrator migrator)
     {
-        private readonly ILogger<GrateMigrator> _logger;
-        private readonly IDbMigrator _migrator;
+        _logger = logger;
+        _migrator = migrator;
+    }
 
-        public IDbMigrator DbMigrator => _migrator;
+    public async Task Migrate()
+    {
+        IDbMigrator dbMigrator = _migrator;
+        await dbMigrator.InitializeConnections();
 
-        public GrateMigrator(ILogger<GrateMigrator> logger, IDbMigrator migrator)
+        var silent = dbMigrator.Configuration.Silent;
+        var database = dbMigrator.Database;
+        var config = dbMigrator.Configuration;
+        IFoldersConfiguration knownFolders = config.Folders ?? throw new ArgumentException(nameof(config.Folders));
+
+
+        _logger.LogInformation("Running grate v{Version} against {ServerName} - {DatabaseName}.",
+            ApplicationInfo.Version,
+            database.ServerName,
+            database.DatabaseName
+        );
+
+        _logger.LogInformation("Looking in {UpFolder} for scripts to run.", config.SqlFilesDirectory);
+
+        PressEnterWhenReady(silent);
+
+        var runInTransaction = MakeSureWeCanRunInTransaction(config.Transaction, silent, dbMigrator);
+
+        var changeDropFolder = ChangeDropFolder(config, database.ServerName, database.DatabaseName);
+        CreateChangeDropFolder(changeDropFolder);
+
+        _logger.LogDebug("The change_drop (output) folder is: {ChangeDropFolder}", changeDropFolder);
+        Separator('=');
+
+        _logger.LogInformation("Setup, Backup, Create/Restore/Drop");
+        Separator('=');
+        
+        TransactionScope? scope = null;
+        IList<Exception> exceptions = new List<Exception>();
+        string? newVersion = default;
+        long versionId = default;
+        
+        dbMigrator.SetDefaultConnectionActive();
+        
+        if (config.Drop)
         {
-            _logger = logger;
-            _migrator = migrator;
+            await dbMigrator.DropDatabase();
+            _logger.LogInformation("{AppName} has removed database ({DatabaseName}) if it existed.", ApplicationInfo.Name, database.DatabaseName);
         }
 
-        public async Task Migrate()
+        var databaseCreated = false;
+        if (config.CreateDatabase)
         {
-            IDbMigrator dbMigrator = _migrator;
-            await dbMigrator.InitializeConnections();
+            databaseCreated = await CreateDatabaseIfItDoesNotExist(dbMigrator);
+        }
+            
+        if (!string.IsNullOrEmpty(config.Restore))
+        {
+            await RestoreDatabaseFromPath(config.Restore, dbMigrator);
+        }
 
-            var silent = dbMigrator.Configuration.Silent;
-            var database = dbMigrator.Database;
-            var config = dbMigrator.Configuration;
-            KnownFolders knownFolders = config.KnownFolders ?? throw new ArgumentException(nameof(config.KnownFolders));
+        // Run these first without a transaction, to make sure the tables are created even on a potential rollback
+        await CreateGrateStructure(dbMigrator);
 
+        (versionId, newVersion) = await VersionTheDatabase(dbMigrator);
 
-            _logger.LogInformation("Running grate v{version} against {serverName} - {databaseName}.",
-                ApplicationInfo.Version,
-                database?.ServerName,
-                database?.DatabaseName
-                );
-
-            _logger.LogInformation("Looking in {upFolder} for scripts to run.", knownFolders?.Up?.Path);
-
-            PressEnterWhenReady(silent);
-
-            var runInTransaction = MakeSureWeCanRunInTransaction(config.Transaction, silent, dbMigrator);
-
-            var changeDropFolder = ChangeDropFolder(config, database?.ServerName, database?.DatabaseName);
-            CreateChangeDropFolder(changeDropFolder);
-
-            _logger.LogDebug("The change_drop (output) folder is: {changeDropFolder}", changeDropFolder);
-            Separator('=');
-
-            _logger.LogInformation("Setup, Backup, Create/Restore/Drop");
-            Separator('=');
-
-            if (config.Drop)
+        Separator('=');
+        _logger.LogInformation("Migration Scripts");
+        Separator('=');
+        
+        try
+        {
+            // Start the transaction, if configured
+            if (runInTransaction)
             {
-                await dbMigrator.DropDatabase();
-                _logger.LogInformation("{appName} has removed database ({databaseName}) if it existed.", ApplicationInfo.Name, database?.DatabaseName);
+                scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
             }
 
-            var databaseCreated = false;
+            bool exceptionOccured = false;
 
-            if (config.CreateDatabase)
+            foreach (var folder in knownFolders.Values)
             {
-                databaseCreated = await CreateDatabaseIfItDoesNotExist(dbMigrator);
+                var processingFolderInDefaultTransaction = folder?.TransactionHandling == TransactionHandling.Default;
+                
+                // Don't run any more folders that runs in the default transaction, if the transaction is already aborted
+                // (due to an error in a script, or something else)
+                if (exceptionOccured && processingFolderInDefaultTransaction)
+                {
+                    continue;
+                }
+                
+                // This is an ugly "if" run on every script, to check one special folder which has conditions.
+                // If possible, we should find a 'cleaner' way to do this.
+                if (nameof(KnownFolderNames.RunAfterCreateDatabase).Equals(folder?.Name) && ! databaseCreated)
+                {
+                    continue;
+                }
+                
+                try {
+                    if (processingFolderInDefaultTransaction)
+                    {
+                        await LogAndProcess(config.SqlFilesDirectory, folder!, changeDropFolder, versionId, folder!.ConnectionType, folder.TransactionHandling);
+                    }
+                    else
+                    {
+                        using var s = new TransactionScope(TransactionScopeOption.Suppress, TransactionScopeAsyncFlowOption.Enabled);
+                        using (await dbMigrator.OpenNewActiveConnection())
+                        {
+                            await LogAndProcess(config.SqlFilesDirectory, folder!, changeDropFolder, versionId, folder!.ConnectionType, folder.TransactionHandling);
+                        }
+                        s.Complete();
+                    }
+                }catch (DbException ex)
+                {
+                    // Catch exceptions, so that we run the rest of the scripts, that should always be run.
+                    exceptions.Add(ex);
+                    exceptionOccured = true;
+                }
             }
-
-            TransactionScope? scope = null;
-            try
+            
+            await dbMigrator.CloseConnection();
+            
+            if (!exceptionOccured)
             {
-                // Run these first without a transaction, to make sure the tables are created even on a potential rollback
-                await CreateGrateStructure(dbMigrator);
-
-                // Start the transaction, if configured
-                if (runInTransaction)
-                {
-                    scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
-                }
-
-                await dbMigrator.OpenConnection();
-                var (versionId, newVersion) = await VersionTheDatabase(dbMigrator);
-
-                Separator('=');
-                _logger.LogInformation("Migration Scripts");
-                Separator('=');
-
-                // This one should not be necessary, we throw on assignment if null
-                System.Diagnostics.Debug.Assert(knownFolders != null, nameof(knownFolders) + " != null");
-
-                await BeforeMigration(knownFolders, changeDropFolder, versionId);
-
-                if (config.AlterDatabase)
-                {
-                    await AlterDatabase(dbMigrator, knownFolders, changeDropFolder, versionId);
-                }
-
-                if (databaseCreated)
-                {
-                    await LogAndProcess(knownFolders.RunAfterCreateDatabase!, changeDropFolder, versionId, ConnectionType.Default);
-                }
-
-                await LogAndProcess(knownFolders.RunBeforeUp!, changeDropFolder, versionId, ConnectionType.Default);
-                await LogAndProcess(knownFolders.Up!, changeDropFolder, versionId, ConnectionType.Default);
-                await LogAndProcess(knownFolders.RunFirstAfterUp!, changeDropFolder, versionId, ConnectionType.Default);
-                await LogAndProcess(knownFolders.Functions!, changeDropFolder, versionId, ConnectionType.Default);
-                await LogAndProcess(knownFolders.Views!, changeDropFolder, versionId, ConnectionType.Default);
-                await LogAndProcess(knownFolders.Sprocs!, changeDropFolder, versionId, ConnectionType.Default);
-                await LogAndProcess(knownFolders.Triggers!, changeDropFolder, versionId, ConnectionType.Default);
-                await LogAndProcess(knownFolders.Indexes!, changeDropFolder, versionId, ConnectionType.Default);
-                await LogAndProcess(knownFolders.RunAfterOtherAnyTimeScripts!, changeDropFolder, versionId, ConnectionType.Default);
-
                 scope?.Complete();
-
-                using (new TransactionScope(TransactionScopeOption.Suppress, TransactionScopeAsyncFlowOption.Enabled))
-                {
-                    await LogAndProcess(knownFolders.Permissions!, changeDropFolder, versionId, ConnectionType.Default);
-                    await LogAndProcess(knownFolders.AfterMigration!, changeDropFolder, versionId, ConnectionType.Default);
-                }
-
-                _logger.LogInformation(
-                    "\n\ngrate v{version} has grated your database ({databaseName})! You are now at version {newVersion}. All changes and backups can be found at \"{changeDropFolder}\".",
-                    ApplicationInfo.Version,
-                    dbMigrator?.Database?.DatabaseName,
-                    newVersion,
-                    changeDropFolder);
-
-                Separator(' ');
-
             }
-            finally
+        }
+        finally
+        {
+            try
             {
                 scope?.Dispose();
             }
-
+            catch (TransactionAbortedException) { }
         }
 
-        private async Task AlterDatabase(IDbMigrator dbMigrator, KnownFolders knownFolders, string changeDropFolder,
-            long versionId)
+        if (exceptions.Any())
         {
-            using (new TransactionScope(TransactionScopeOption.Suppress,
-                TransactionScopeAsyncFlowOption.Enabled))
+            throw new MigrationFailed(exceptions);
+        }
+
+        if (!config.DryRun)
+        {
+            //If we get here this means no exceptions are thrown above, so we can conclude the migration was successfull!
+            await _migrator.Database.ChangeVersionStatus(MigrationStatus.Finished, versionId);
+        }
+
+        _logger.LogInformation(
+            "\n\ngrate v{Version} has grated your database ({DatabaseName})! You are now at version {NewVersion}. All changes and backups can be found at \"{ChangeDropFolder}\".",
+            ApplicationInfo.Version,
+            dbMigrator.Database.DatabaseName,
+            newVersion,
+            changeDropFolder);
+
+        Separator(' ');
+
+
+    }
+
+    private async Task EnsureConnectionIsOpen(ConnectionType connectionType)
+    {
+        switch (connectionType)
+        {
+            case ConnectionType.Default:
+                await _migrator.OpenActiveConnection();
+                break;
+            case ConnectionType.Admin:
+                await _migrator.OpenAdminConnection();
+                break;
+            default:
+                throw new UnknownConnectionType(connectionType);
+        }
+    }
+
+    private async Task CreateGrateStructure(IDbMigrator dbMigrator)
+    {
+        Separator('=');
+        _logger.LogInformation("Grate Structure");
+        Separator('=');
+
+        if (dbMigrator.Configuration.DryRun)
+        {
+            _logger.LogInformation("Skipping creation of versioning structures due to --dryrun");
+        }
+        else
+        {
+            using var s = new TransactionScope(TransactionScopeOption.Suppress, TransactionScopeAsyncFlowOption.Enabled);
+            using (await dbMigrator.OpenNewActiveConnection())
             {
-                await dbMigrator.OpenAdminConnection();
-                await LogAndProcess(knownFolders!.AlterDatabase!, changeDropFolder, versionId, ConnectionType.Admin);
-                await dbMigrator.CloseAdminConnection();
+                await dbMigrator.RunSupportTasks();
             }
+            s.Complete();
+        }
+    }
+
+    private async Task<(long, string)> VersionTheDatabase(IDbMigrator dbMigrator)
+    {
+        Separator('=');
+        _logger.LogInformation("Versioning");
+        Separator('=');
+
+        var currentVersion = await dbMigrator.GetCurrentVersion();
+        var newVersion = dbMigrator.Configuration.Version;
+        _logger.LogInformation(" Migrating {DatabaseName} from version {CurrentVersion} to {NewVersion}.", dbMigrator.Database.DatabaseName, currentVersion, newVersion);
+        var versionId = await dbMigrator.VersionTheDatabase(newVersion);
+
+        return (versionId, newVersion);
+    }
+
+    private static async Task<bool> CreateDatabaseIfItDoesNotExist(IDbMigrator dbMigrator)
+    {
+        bool databaseCreated;
+        if (await dbMigrator.DatabaseExists())
+        {
+            databaseCreated = false;
+        }
+        else
+        {
+            databaseCreated = await dbMigrator.CreateDatabase();
+        }
+        return databaseCreated;
+    }
+
+    private static async Task RestoreDatabaseFromPath(string backupPath, IDbMigrator dbMigrator)
+    {
+        await dbMigrator.RestoreDatabase(backupPath);
+    }
+
+    private DirectoryInfo Wrap(DirectoryInfo root, string subFolder) => new(Path.Combine(root.ToString(), subFolder));
+
+    private async Task LogAndProcess(DirectoryInfo root, MigrationsFolder folder, string changeDropFolder, long versionId, ConnectionType connectionType, TransactionHandling transactionHandling)
+    {
+        var path = Wrap(root, folder.Path);
+
+        if (!path.Exists)
+        {
+            _logger.LogInformation("Skipping '{FolderName}', {Path} does not exist.", folder.Name, folder.Path);
+            return;
         }
 
-        private async Task BeforeMigration(KnownFolders knownFolders, string changeDropFolder, long versionId)
+        if (!path.EnumerateFileSystemInfos().Any()) // Ensure we check for subdirectories as well as files
         {
-            using (new TransactionScope(TransactionScopeOption.Suppress, TransactionScopeAsyncFlowOption.Enabled))
-            {
-                await LogAndProcess(knownFolders!.BeforeMigration!, changeDropFolder, versionId, ConnectionType.Default);
-            }
+            _logger.LogInformation("Skipping '{FolderName}', {Path} is empty.", folder.Name, folder.Path);
+            return;
         }
 
-        private async Task CreateGrateStructure(IDbMigrator dbMigrator)
+        Separator(' ');
+
+        var msg = folder.Type switch
         {
-            await dbMigrator.OpenConnection();
+            MigrationType.Once => " These should be one time only scripts.",
+            MigrationType.EveryTime => " These scripts will run every time.",
+            MigrationType.AnyTime => "",
+            _ => throw new ArgumentOutOfRangeException(nameof(folder), $"Unexpected MigrationsFolder: {folder.Type}")
+        };
 
-            Separator('=');
-            _logger.LogInformation("Grate Structure");
-            Separator('=');
+        _logger.LogInformation("Looking for {FolderName} scripts in \"{Path}\".{Message}",
+            folder.Name,
+            Wrap(root, folder.Path),
+            msg);
 
-            await dbMigrator.RunSupportTasks();
-            await dbMigrator.CloseConnection();
-        }
+        Separator('-');
+        await Process(root, folder, changeDropFolder, versionId, connectionType, transactionHandling);
+        Separator('-');
+        Separator(' ');
+    }
 
-        private async Task<(long, string)> VersionTheDatabase(IDbMigrator dbMigrator)
+    private async Task Process(DirectoryInfo root, MigrationsFolder folder, string changeDropFolder, long versionId,
+        ConnectionType connectionType, TransactionHandling transactionHandling)
+    {
+        var path = Wrap(root, folder.Path);
+
+        await EnsureConnectionIsOpen(connectionType);
+
+        var pattern = "*.sql";
+        var files = FileSystem.GetFiles(path, pattern);
+
+        var anySqlRun = false;
+
+        foreach (var file in files)
         {
-            Separator('=');
-            _logger.LogInformation("Versioning");
-            Separator('=');
+            var sql = await File.ReadAllTextAsync(file.FullName);
 
-            var currentVersion = await dbMigrator.GetCurrentVersion();
-            var newVersion = dbMigrator.Configuration.Version;
-            _logger.LogInformation(" Migrating {databaseName} from version {currentVersion} to {newVersion}.", dbMigrator.Database?.DatabaseName, currentVersion, newVersion);
-            var versionId = await dbMigrator.VersionTheDatabase(newVersion);
+            // Normalize file names to log, so that results won't vary if you run on *nix VS Windows
+            var fileNameToLog = string.Join('/',
+                Path.GetRelativePath(path.ToString(), file.FullName).Split(Path.DirectorySeparatorChar));
 
-            return (versionId, newVersion);
-        }
+            bool theSqlRan = await _migrator.RunSql(sql, fileNameToLog, folder.Type, versionId, _migrator.Configuration.Environment,
+                connectionType, transactionHandling);
 
-        private static async Task<bool> CreateDatabaseIfItDoesNotExist(IDbMigrator dbMigrator)
-        {
-            bool databaseCreated;
-            if (await dbMigrator.DatabaseExists())
+            if (theSqlRan)
             {
-                databaseCreated = false;
-            }
-            else
-            {
-                await dbMigrator.OpenAdminConnection();
-                databaseCreated = await dbMigrator.CreateDatabase();
-                await dbMigrator.CloseAdminConnection();
-            }
-            return databaseCreated;
-        }
-
-        private async Task LogAndProcess(MigrationsFolder folder, string changeDropFolder, long versionId, ConnectionType connectionType)
-        {
-            Separator(' ');
-
-            var msg = folder.Type switch
-            {
-                MigrationType.Once => " These should be one time only scripts.",
-                MigrationType.EveryTime => " These scripts will run every time.",
-                MigrationType.AnyTime => "",
-                _ => throw new ArgumentOutOfRangeException(nameof(folder), $"Unexpected MigrationsFolder: {folder.Type}")
-            };
-
-            _logger.LogInformation("Looking for {folderName} scripts in \"{path}\".{message}",
-                folder.Name,
-                folder.Path,
-                msg);
-
-            Separator('-');
-            await Process(folder, changeDropFolder, versionId, connectionType);
-            Separator('-');
-            Separator(' ');
-        }
-
-        private async Task Process(MigrationsFolder folder, string changeDropFolder, long versionId, ConnectionType connectionType)
-        {
-            if (!folder.Path.Exists)
-            {
-                _logger.LogDebug("{Path} does not exist. Skipping.", folder.Path);
-                return;
-            }
-
-            var pattern = "*.sql";
-            var files = GetFiles(folder.Path, pattern);
-
-            foreach (var file in files)
-            {
-                var sql = await File.ReadAllTextAsync(file.FullName);
-
-                bool theSqlRan = await _migrator.RunSql(sql, file.Name, folder.Type, versionId, _migrator.Configuration.Environment,
-                    connectionType);
-
-                if (theSqlRan)
+                anySqlRun = true;
+                try
                 {
-                    try
-                    {
-                        CopyToChangeDropFolder(file, changeDropFolder);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Unable to copy {file} to {changeDropFolder}. \n{exception}", file, changeDropFolder, ex.Message);
-                    }
+                    CopyToChangeDropFolder(path.Parent!, file, changeDropFolder);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Unable to copy {File} to {ChangeDropFolder}. \n{Exception}", file, changeDropFolder, ex.Message);
                 }
             }
-
         }
 
-        private void CopyToChangeDropFolder(FileSystemInfo file, string changeDropFolder)
+        if (!anySqlRun)
         {
-            var cfg = _migrator.Configuration;
-
-            var relativePath = Path.GetRelativePath(cfg.SqlFilesDirectory.ToString(), file.FullName);
-
-            string destinationFile = Path.Combine(changeDropFolder, "itemsRan", relativePath);
-
-            var parent = Path.GetDirectoryName(destinationFile)!;
-            var parentDir = new DirectoryInfo(parent);
-            parentDir.Create();
-
-            _logger.LogTrace("Copying file {Filename} to {Destination}", file.FullName, destinationFile);
-
-            File.Copy(file.FullName, destinationFile);
+            _logger.LogInformation(" No sql run, either an empty folder, or all files run against destination previously.");
         }
 
-        private static IEnumerable<FileSystemInfo> GetFiles(DirectoryInfo folderPath, string pattern)
-        {
-            return folderPath
-                .EnumerateFileSystemInfos(pattern, SearchOption.AllDirectories).ToList()
-                .OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase);
-        }
-        
-#pragma warning disable CA2254 // Template should be a static expression.  Bug in pre-release .net 6: https://github.com/dotnet/roslyn-analyzers/issues/5415
-        private void Separator(char c) => _logger.LogInformation(new string(c, 80));
+    }
+
+    private void CopyToChangeDropFolder(DirectoryInfo migrationRoot, FileSystemInfo file, string changeDropFolder)
+    {
+        var relativePath = Path.GetRelativePath(migrationRoot.ToString(), file.FullName);
+
+        string destinationFile = Path.Combine(changeDropFolder, "itemsRan", relativePath);
+
+        var parent = Path.GetDirectoryName(destinationFile)!;
+        var parentDir = new DirectoryInfo(parent);
+        parentDir.Create();
+
+        _logger.LogTrace("Copying file {Filename} to {Destination}", file.FullName, destinationFile);
+
+        File.Copy(file.FullName, destinationFile);
+    }
+
+    // ReSharper disable once TemplateIsNotCompileTimeConstantProblem
+#pragma warning disable CA2254 // Template should be a static expression.
+    private void Separator(char c) => _logger.LogInformation(new string(c, 80));
 #pragma warning restore CA2254 // Template should be a static expression
 
-        private static void CreateChangeDropFolder(string folder)
+    private static void CreateChangeDropFolder(string folder)
+    {
+        if (Directory.Exists(folder))
         {
-            if (Directory.Exists(folder))
-            {
-                Directory.Delete(folder, recursive: true);
-            }
-            Directory.CreateDirectory(folder);
+            Directory.Delete(folder, recursive: true);
         }
+        Directory.CreateDirectory(folder);
+    }
 
-        public static string ChangeDropFolder(GrateConfiguration config, string? server, string? database)
+    public static string ChangeDropFolder(GrateConfiguration config, string? server, string? database)
+    {
+        var folder = Path.Combine(
+            config.OutputPath.ToString(),
+            "migrations",
+            RemoveInvalidPathChars(database),
+            RemoveInvalidPathChars(server),
+            RemoveInvalidPathChars(DateTime.Now.ToString("O"))
+        );
+        return folder;
+    }
+
+    private static readonly char[] InvalidPathCharacters = Path.GetInvalidPathChars()
+        .Append(':')
+        .Append(',')
+        .Append('+')
+        .ToArray();
+
+    private static string RemoveInvalidPathChars(string? path)
+    {
+        var builder = new StringBuilder(path);
+        foreach (var c in InvalidPathCharacters)
         {
-            var folder = Path.Combine(
-                config.OutputPath!.ToString(),
-                "migrations",
-                RemoveInvalidPathChars(database),
-                RemoveInvalidPathChars(server),
-                RemoveInvalidPathChars(DateTime.Now.ToString("s"))
-            );
-            return folder;
+            builder.Replace(c, '_');
         }
+        return builder.ToString();
+    }
 
-        private static readonly char[] InvalidPathCharacters = Path.GetInvalidPathChars()
-                                                                    .Append(':')
-                                                                    .Append(',')
-                                                                    .ToArray();
-
-        private static string RemoveInvalidPathChars(string? path)
+    private void PressEnterWhenReady(bool silent)
+    {
+        if (!silent)
         {
-            var builder = new StringBuilder(path);
-            foreach (var c in InvalidPathCharacters)
-            {
-                builder.Replace(c, '_');
-            }
-            return builder.ToString();
+            _logger.LogInformation("Please press enter when ready to kick...");
+            Console.ReadLine();
         }
+    }
 
-        private void PressEnterWhenReady(bool silent)
+    private bool MakeSureWeCanRunInTransaction(bool runInTransaction, bool silent, IDbMigrator dbMigrator)
+    {
+        if (runInTransaction && !dbMigrator.Database.SupportsDdlTransactions)
         {
+            _logger.LogWarning("You asked to run in a transaction, but this database type doesn't support DDL transactions.");
             if (!silent)
             {
-                _logger.LogInformation("Please press enter when ready to kick...");
+                _logger.LogInformation("Please press enter to continue without transaction support...");
                 Console.ReadLine();
             }
+            return false;
         }
 
-        private bool MakeSureWeCanRunInTransaction(bool runInTransaction, bool silent, IDbMigrator dbMigrator)
-        {
-            if (runInTransaction && !dbMigrator.Database!.SupportsDdlTransactions)
-            {
-                _logger.LogWarning("You asked to run in a transaction, but this databasetype doesn't support DDL transactions.");
-                if (!silent)
-                {
-                    _logger.LogInformation("Please press enter to continue without transaction support...");
-                    Console.ReadLine();
-                }
-                return false;
-            }
+        return runInTransaction;
+    }
 
-            return runInTransaction;
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            await _migrator.DisposeAsync();
-            GC.SuppressFinalize(this);
-        }
+    public async ValueTask DisposeAsync()
+    {
+        await _migrator.DisposeAsync();
+        GC.SuppressFinalize(this);
     }
 }

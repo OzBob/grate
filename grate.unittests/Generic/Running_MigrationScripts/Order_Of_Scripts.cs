@@ -1,5 +1,4 @@
-﻿using System.IO;
-using System.Linq;
+﻿using System.Linq;
 using System.Threading.Tasks;
 using Dapper;
 using FluentAssertions;
@@ -8,93 +7,95 @@ using grate.Configuration;
 using grate.Migration;
 using grate.unittests.TestInfrastructure;
 using NUnit.Framework;
+using static grate.Configuration.KnownFolderKeys;
 
-namespace grate.unittests.Generic.Running_MigrationScripts
+namespace grate.unittests.Generic.Running_MigrationScripts;
+
+[TestFixture]
+// ReSharper disable once InconsistentNaming
+public abstract class Order_Of_Scripts: MigrationsScriptsBase
 {
-    [TestFixture]
-    public abstract class Order_Of_Scripts: MigrationsScriptsBase
+    [Test()]
+    public async Task Is_as_expected()
     {
-        [Test()]
-        public async Task Is_as_expected()
+        var db = TestConfig.RandomDatabase();
+
+        GrateMigrator? migrator;
+        await using (migrator = GetMigrator(db, true))
         {
-            var db = TestConfig.RandomDatabase();
-
-            GrateMigrator? migrator;
-            await using (migrator = GetMigrator(db, true))
-            {
-                await migrator.Migrate();
-            }
-
-            string[] scripts;
-            string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
-            
-            await using (var conn = Context.CreateDbConnection(db))
-            {
-                scripts = (await conn.QueryAsync<string>(sql)).ToArray();
-            }
-
-            var expectation = new[]
-            {
-                "1_beforemigration.sql",
-                "1_alterdatabase.sql",
-                "1_aftercreate.sql",
-                "1_beforeup.sql",
-                "1_up.sql",
-                "1_firstafterup.sql",
-                "1_functions.sql",
-                "1_views.sql",
-                "1_sprocs.sql",
-                "1_triggers.sql",
-                "1_indexes.sql",
-                "1_afterotherany.sql",
-                "1_permissions.sql",
-                "1_aftermigration.sql",
-            };
-            
-            scripts.Should().BeEquivalentTo(expectation);
-            scripts.Should().HaveCount(14);
-
-            using (new AssertionScope())
-            {
-                for (int i = 0; i < expectation.Length; i++)
-                {
-                    scripts[i].Should().Be(expectation[i]);
-                }
-            }
+            await migrator.Migrate();
         }
 
-
-        private GrateMigrator GetMigrator(string databaseName, bool createDatabase)
-        {
-            var dummyFile = Path.GetTempFileName();
-            File.Delete(dummyFile);
-
-            var scriptsDir = Directory.CreateDirectory(dummyFile);
+        string[] scripts;
+        string sql = $"SELECT script_name FROM {Context.Syntax.TableWithSchema("grate", "ScriptsRun")}";
             
-            var config = Context.DefaultConfiguration with
-            {
-                CreateDatabase = createDatabase, 
-                ConnectionString = Context.ConnectionString(databaseName),
-                KnownFolders = KnownFolders.In(scriptsDir)
-            };
-
-            CreateDummySql(config.KnownFolders.AfterMigration, "1_aftermigration.sql");
-            CreateDummySql(config.KnownFolders.AlterDatabase, "1_alterdatabase.sql");
-            CreateDummySql(config.KnownFolders.BeforeMigration, "1_beforemigration.sql");
-            CreateDummySql(config.KnownFolders.Functions, "1_functions.sql");
-            CreateDummySql(config.KnownFolders.Indexes, "1_indexes.sql");
-            CreateDummySql(config.KnownFolders.Permissions, "1_permissions.sql");
-            CreateDummySql(config.KnownFolders.RunAfterCreateDatabase, "1_aftercreate.sql");
-            CreateDummySql(config.KnownFolders.RunAfterOtherAnyTimeScripts, "1_afterotherany.sql");
-            CreateDummySql(config.KnownFolders.RunBeforeUp, "1_beforeup.sql");
-            CreateDummySql(config.KnownFolders.RunFirstAfterUp, "1_firstafterup.sql");
-            CreateDummySql(config.KnownFolders.Sprocs, "1_sprocs.sql");
-            CreateDummySql(config.KnownFolders.Triggers, "1_triggers.sql");
-            CreateDummySql(config.KnownFolders.Up, "1_up.sql");
-            CreateDummySql(config.KnownFolders.Views, "1_views.sql");
-
-            return Context.GetMigrator(config);
-
+        await using (var conn = Context.CreateDbConnection(db))
+        {
+            scripts = (await conn.QueryAsync<string>(sql)).ToArray();
         }
+
+        var expectation = new[]
+        {
+            "1_beforemigration.sql",
+            "1_alterdatabase.sql",
+            "1_aftercreate.sql",
+            "1_beforeup.sql",
+            "1_up.sql",
+            "1_firstafterup.sql",
+            "1_functions.sql",
+            "1_views.sql",
+            "1_sprocs.sql",
+            "1_triggers.sql",
+            "1_indexes.sql",
+            "1_afterotherany.sql",
+            "1_permissions.sql",
+            "1_aftermigration.sql",
+        };
+            
+        scripts.Should().BeEquivalentTo(expectation);
+        scripts.Should().HaveCount(14);
+
+        using (new AssertionScope())
+        {
+            for (int i = 0; i < expectation.Length; i++)
+            {
+                scripts[i].Should().Be(expectation[i]);
+            }
+        }
+    }
+
+
+    private GrateMigrator GetMigrator(string databaseName, bool createDatabase)
+    {
+        var scriptsDir = CreateRandomTempDirectory();
+            
+        var config = Context.DefaultConfiguration with
+        {
+            CreateDatabase = createDatabase, 
+            ConnectionString = Context.ConnectionString(databaseName),
+            Folders = FoldersConfiguration.Default(null),
+            SqlFilesDirectory = scriptsDir
+            
+        };
+
+        var knownFolders = config.Folders;
+        
+        CreateDummySql(scriptsDir, knownFolders[AfterMigration], "1_aftermigration.sql");
+        CreateDummySql(scriptsDir, knownFolders[AlterDatabase], "1_alterdatabase.sql");
+        CreateDummySql(scriptsDir, knownFolders[BeforeMigration], "1_beforemigration.sql");
+        CreateDummySql(scriptsDir, knownFolders[Functions], "1_functions.sql");
+        CreateDummySql(scriptsDir, knownFolders[Indexes], "1_indexes.sql");
+        CreateDummySql(scriptsDir, knownFolders[Permissions], "1_permissions.sql");
+        CreateDummySql(scriptsDir, knownFolders[RunAfterCreateDatabase], "1_aftercreate.sql");
+        CreateDummySql(scriptsDir, knownFolders[RunAfterOtherAnyTimeScripts], "1_afterotherany.sql");
+        CreateDummySql(scriptsDir, knownFolders[RunBeforeUp], "1_beforeup.sql");
+        CreateDummySql(scriptsDir, knownFolders[RunFirstAfterUp], "1_firstafterup.sql");
+        CreateDummySql(scriptsDir, knownFolders[Sprocs], "1_sprocs.sql");
+        CreateDummySql(scriptsDir, knownFolders[Triggers], "1_triggers.sql");
+        CreateDummySql(scriptsDir, knownFolders[Up], "1_up.sql");
+        CreateDummySql(scriptsDir, knownFolders[Views], "1_views.sql");
+
+        return Context.GetMigrator(config);
+
     }
 }
